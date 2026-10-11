@@ -23,7 +23,6 @@ class PredictionPool(gl.Contract):
     no_pool_map: TreeMap[str, u256]
     yes_count_map: TreeMap[str, u256]
     no_count_map: TreeMap[str, u256]
-    winning_count_map: TreeMap[str, u256]
     topic_counter: u256
 
     stake_map: TreeMap[str, u256]
@@ -67,7 +66,6 @@ class PredictionPool(gl.Contract):
         self.no_pool_map[topic_id] = u256(0)
         self.yes_count_map[topic_id] = u256(0)
         self.no_count_map[topic_id] = u256(0)
-        self.winning_count_map[topic_id] = u256(0)
 
         return topic_id
 
@@ -78,7 +76,7 @@ class PredictionPool(gl.Contract):
         assert str(datetime.datetime.now()) < self.deadline_map[topic_id], "Staking window has closed"
         assert gl.message.value > u256(0), "You must stake a positive amount"
 
-        addr = str(gl.message.sender_address)
+        addr = str(gl.message.sender_address).lower()
         position_key = f"{topic_id}:{addr}"
         assert self._get_side(position_key) == "", "You already staked on this topic"
 
@@ -145,35 +143,33 @@ or
 
         self.outcome_map[topic_id] = outcome
         self.status_map[topic_id] = "RESOLVED"
-        if outcome == "YES":
-            self.winning_count_map[topic_id] = self.yes_count_map[topic_id]
-        else:
-            self.winning_count_map[topic_id] = self.no_count_map[topic_id]
 
         return outcome
 
     @gl.public.write
     def claim_winnings(self, topic_id: str) -> str:
         assert self.status_map[topic_id] == "RESOLVED", "Topic not resolved yet"
-        addr = str(gl.message.sender_address)
+        addr = str(gl.message.sender_address).lower()
         position_key = f"{topic_id}:{addr}"
         side = self._get_side(position_key)
         assert side != "", "You did not stake on this topic"
         assert self._get_claimed(position_key) == "no", "Already claimed"
 
         outcome = self.outcome_map[topic_id]
-        winning_count = self.winning_count_map[topic_id]
         stake_key = f"{topic_id}:{side}:{addr}"
         my_stake = self._get_stake(stake_key)
 
-        if winning_count == u256(0):
-            payout = my_stake
-        elif side == outcome:
-            losing_pool = self.no_pool_map[topic_id] if outcome == "YES" else self.yes_pool_map[topic_id]
-            bonus = losing_pool // winning_count
-            payout = my_stake + bonus
-        else:
-            raise Exception("You staked on the losing side; nothing to claim.")
+        assert side == outcome, "You staked on the losing side; nothing to claim."
+
+        winning_pool = self.yes_pool_map[topic_id] if outcome == "YES" else self.no_pool_map[topic_id]
+        losing_pool = self.no_pool_map[topic_id] if outcome == "YES" else self.yes_pool_map[topic_id]
+
+        # Proportional (pari-mutuel) share: your bonus is the same fraction of the
+        # losing pool as your stake is of the entire winning pool, not a flat
+        # per-wallet split. winning_pool is always > 0 here since my_stake > 0
+        # and my_stake is itself part of winning_pool.
+        bonus = (losing_pool * my_stake) // winning_pool
+        payout = my_stake + bonus
 
         self.claimed_map[position_key] = "yes"
         _Recipient(gl.message.sender_address).emit_transfer(value=payout)
@@ -181,9 +177,19 @@ or
 
     @gl.public.write
     def claim_abandoned_refund(self, topic_id: str) -> None:
-        assert self.status_map[topic_id] == "OPEN", "Topic already resolved or cancelled"
+        assert self.status_map[topic_id] in ("OPEN", "ABANDONED"), "Topic already resolved or cancelled"
         assert str(datetime.datetime.now()) >= self.abandon_deadline_map[topic_id], "Abandonment grace period hasn't passed"
-        addr = str(gl.message.sender_address)
+
+        # The first refund claim atomically flips the topic to ABANDONED. From
+        # that point on, resolve_topic and stake_prediction both require status
+        # == "OPEN", so neither can run again — this topic can never be resolved
+        # or staked into after any refund has been paid out, so claim_winnings
+        # can never be computed against pool balances that refunds have already
+        # drained.
+        if self.status_map[topic_id] == "OPEN":
+            self.status_map[topic_id] = "ABANDONED"
+
+        addr = str(gl.message.sender_address).lower()
         position_key = f"{topic_id}:{addr}"
         side = self._get_side(position_key)
         assert side != "", "You did not stake on this topic"
@@ -212,9 +218,9 @@ or
 
     @gl.public.view
     def get_my_position(self, topic_id: str, address: str) -> dict:
-        position_key = f"{topic_id}:{address}"
+        position_key = f"{topic_id}:{address.lower()}"
         side = self._get_side(position_key)
-        stake_key = f"{topic_id}:{side}:{address}"
+        stake_key = f"{topic_id}:{side}:{address.lower()}"
         return {
             "side": side if side != "" else "NONE",
             "stake": str(self._get_stake(stake_key)),
