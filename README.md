@@ -46,8 +46,8 @@ or a trusted third party.
 | Stakes | Parallel `TreeMap[str, ...]` keyed by `topic_id:address` (side, claimed status) and `topic_id:side:address` (stake amount) |
 | AI resolution | `gl.nondet.web.render` fetches the source URL; `gl.nondet.exec_prompt` inside a closure, reconciled across validators via `gl.eq_principle.prompt_comparative` |
 | Output safety | Resolver output is validated (JSON parse, structure, field presence, type, and domain of the `outcome` field) before any state mutation or fund transfer |
-| Payout | Pari-mutuel — each winner receives their own stake back plus `losing_pool // winning_count` |
-| Fund safety | Funds only move on `claim_winnings` (after `RESOLVED`), `cancel_topic` (only before any stakes placed), or `claim_abandoned_refund` (30 days past deadline, topic still unresolved) |
+| Payout | Pari-mutuel, proportional to stake — each winner receives their own stake back plus `(losing_pool * my_stake) // winning_pool`, i.e. their exact share of the losing pool in proportion to their share of the total winning pool, not a flat per-wallet split |
+| Fund safety | Funds only move on `claim_winnings` (after `RESOLVED`), `cancel_topic` (only before any stakes placed), or `claim_abandoned_refund` (30 days past deadline, topic still unresolved). The first `claim_abandoned_refund` call on a topic atomically flips its status to `ABANDONED`, which permanently blocks `resolve_topic` and `stake_prediction` from running on it afterward — so a topic can never be resolved, or have `claim_winnings` computed, against pool balances that refunds have already drained |
 
 Address-derived lookup keys are built with `str(gl.message.sender_address).lower()`
 on the write side and `address.lower()` on the read side. GenLayer's
@@ -75,8 +75,10 @@ that actually staked and claimed successfully.
   Winning stakers claim their stake plus a pari-mutuel share of the losing
   pool. Losing stakers have nothing to claim.
 - **`claim_abandoned_refund(topic_id: str)`**
-  Anyone who staked can reclaim their stake if a topic is still `OPEN` 30
-  days past its original deadline (nobody triggered resolution).
+  Anyone who staked can reclaim their stake if a topic is still `OPEN`/`ABANDONED`
+  30 days past its original deadline (nobody triggered resolution). The first
+  call on a given topic atomically transitions its status to `ABANDONED`,
+  which permanently locks it out of `resolve_topic` and `stake_prediction`.
 
 ### View
 
@@ -109,6 +111,34 @@ that actually staked and claimed successfully.
   agreement across multiple LLM policies (GPT, Gemini, Mistral, Gemma,
   MiniMax).
 
+### Fix round (steward-requested, Oct 2026)
+
+A steward review flagged two fund-safety gaps before accepting the
+contract, both fixed and retested:
+
+1. **Proportional payout, not flat per-wallet split.** The original
+   `claim_winnings` split the losing pool equally across winning wallets
+   (`losing_pool // winning_count`), regardless of stake size. Fixed to
+   `bonus = (losing_pool * my_stake) // winning_pool` — a true pari-mutuel
+   split where a winner's bonus is exactly proportional to their share of
+   the total winning pool.
+2. **Abandoned refunds now atomically lock the topic.** The original
+   `claim_abandoned_refund` paid out an individual refund but never updated
+   the topic's status, leaving `resolve_topic` callable afterward and
+   `claim_winnings` computable against pool balances a refund had already
+   drained. Fixed so the first refund claim on a topic flips its status to
+   `ABANDONED`, permanently blocking both `resolve_topic` and
+   `stake_prediction` from running on it again.
+
+Both fixes verified in Studio: with the abandon grace period temporarily
+shortened for testing, `claim_abandoned_refund` correctly flipped status to
+`ABANDONED`, and both a subsequent `resolve_topic` and a subsequent
+`stake_prediction` call correctly failed with `"Topic not open"`. With the
+real 30-day grace period restored, the full `open_topic → stake_prediction
+→ resolve_topic → claim_winnings` flow was rerun and still correctly paid
+out (`"Claimed 2000000000000000000 wei"`, `FINALIZED`/`SUCCESS`) under the
+new proportional formula.
+
 ## Deployment
 
 ```
@@ -133,9 +163,17 @@ against Studionet / Bradbury testnet.
   and the read side (`address.lower()` on a user-supplied address string),
   or lookups silently miss for addresses that are the same wallet but
   different casing.
-- Pari-mutuel payout math (`losing_pool // winning_count`) is done entirely
-  in integer `u256` arithmetic — no floats anywhere in the payout path, to
-  keep every validator's computation byte-identical.
+- Pari-mutuel payout math (`(losing_pool * my_stake) // winning_pool`) is
+  done entirely in integer `u256` arithmetic — no floats anywhere in the
+  payout path, to keep every validator's computation byte-identical. Since
+  `winning_pool` always includes the claiming winner's own `my_stake` (and
+  `my_stake > 0`), `winning_pool` is guaranteed non-zero wherever this
+  division runs, so no zero-division guard is needed.
+- A write method that both reads and conditionally mutates `status_map` in
+  one step (as the fixed `claim_abandoned_refund` does — flip `OPEN` to
+  `ABANDONED` only on the first call, idempotent after that) is a simple,
+  reliable way to make a multi-call write method's side effect happen
+  exactly once without needing a separate "already processed" flag.
 
 ## Notes on design decisions
 
